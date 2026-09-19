@@ -1,6 +1,8 @@
-# The Zdex dump format (schema version 1)
+# The Zdex dump format (schema versions 1–3)
 
 One JSON file per game build. Zircon writes it, any dumper can. This is the same text as https://zlogic.eu/zdex/format, kept here so it's easy to link and diff.
+
+Each schema version is the one before it plus optional keys, marked *(2)* and *(3)* below. Every one of them defaults to "this dump does not say", so an older reader can ignore them safely and a newer file with none of them set means exactly what an older file means. Since schema 2 the same format carries either an **Unreal Engine** or a **Unity IL2CPP** dump; `header.runtime` says which.
 
 - A UTF-8 JSON object: a `header` (tool, source process, engine guess, engine offsets, globals) and a `packages[]` array.
 - Every class, struct and enum has a **path** such as `/Script/Engine.Actor`. Paths are the identity; every cross-reference (super class, interfaces, member types, parameter types) is a path.
@@ -11,15 +13,19 @@ One JSON file per game build. Zircon writes it, any dumper can. This is the same
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 3,
   "header": {
-    "tool_version": "0.3.0",
+    "tool_version": "0.7.0",
+    "runtime": "unreal",
     "created_utc": "2026-09-15T10:21:04Z",
     "source":  { "kind": "external", "process": "Game-Win64-Shipping.exe", "main_module": "Game-Win64-Shipping.exe",
                  "module_base": "0x7ff64be00000", "image_size": 171896832 },
     "engine":  { "version": "5.6", "confidence": 0.6, "evidence": ["version string: ++UE5+Release-5.6"] },
     "offsets": [ { "name": "UObject.ClassPrivate", "value": 16 }, … ],
-    "globals": [ "GObjects=0x98670c0", "FNamePool=0x9783590" ]
+    "globals": [ "GObjects=0x98670c0", "FNamePool=0x9783590" ],
+    "sources": [ "live", "static" ],
+    "conflicts": [ { "path": "UnityEngine.Vector3, UnityEngine.CoreModule", "field": "token",
+                     "live": "0x20000e2", "other": "0x20000e3", "used": "live" } ]
   },
   "packages": [
     { "name": "/Script/Engine", "classes": [ … ], "structs": [ … ], "enums": [ … ] }
@@ -29,15 +35,18 @@ One JSON file per game build. Zircon writes it, any dumper can. This is the same
 
 | Key | Required | Meaning |
 |---|---|---|
-| schema_version | yes | Integer, currently `1`. Zdex refuses other values. |
+| schema_version | yes | Integer, `1`, `2` or `3`. Zdex refuses anything higher than it understands. |
+| header.runtime *(2)* | no | `"unreal"` (the default) or `"il2cpp"`. Decides how the dump is labelled, which downloads are offered, and how type names are rendered. Zdex reads it out of the first 64 KB, so it belongs in the header. |
 | header.tool_version | no | Free text naming the dumper and version. Shown on the dump page. |
 | header.created_utc | no | ISO-8601 UTC timestamp of the dump. Becomes the build's "dumped" date. |
 | header.source | no | `kind` is one of `internal`, `external`, `dump`, `static`; `process`, `main_module`, `module_base` (hex string), `image_size` (bytes). |
-| header.engine | no | `version` such as `"5.6"`, `confidence` 0–1, `evidence[]` of human-readable strings. |
+| header.engine | no | `version` such as `"5.6"`, `confidence` 0–1, `evidence[]` of human-readable strings. An IL2CPP dump has no engine version; its `evidence[]` records how the runtime's structures were derived instead. |
 | header.offsets[] | no | Derived engine offsets `{name, value}`, for example `UObject.ClassPrivate`. Negative values mean "not found" and are dropped. |
 | header.globals[] | no | Strings of the form `NAME=0xHEX`, module-relative. |
+| header.sources[] *(3)* | no | Which readings produced this dump: `"live"`, `"static"`, or both. A Unity game can be read by injecting and asking the runtime, by solving `global-metadata.dat` off disk with no process at all, or both at once and merged. Absent or a single entry is an ordinary one-reading dump. |
+| header.conflicts[] *(3)* | no | Where two readings of the same build disagreed: `{path, member, field, live, other, used}`. Written in full and never pruned — on a packed or obfuscated build the disagreement is the finding, so it is recorded rather than quietly resolved. `used` names the side the dump carries. |
 | names[] | no | Optional FName pool. Ignored on import. |
-| packages[] | yes | Each with `name` (a package path) and optional `classes[]`, `structs[]`, `enums[]`. |
+| packages[] | yes | Each with `name` (a package path such as `/Script/Engine`, or an assembly file name such as `Assembly-CSharp.dll`) and optional `classes[]`, `structs[]`, `enums[]`. |
 
 ## Classes and structs
 
@@ -59,6 +68,11 @@ One JSON file per game build. Zircon writes it, any dumper can. This is the same
 | size, alignment, inherited_size | no | Bytes. `inherited_size` is where this type's own members start (aligned). |
 | vtable_rva | no | Classes only, hex string, module-relative. |
 | interfaces[] | no | Paths of implemented interfaces. |
+| namespace *(2)* | no | The C# namespace, kept apart from `path` because splitting `UnityEngine.UI.Button` back apart at the dots is guesswork. |
+| is_valuetype, is_interface, is_abstract, is_generic *(2)* | no | What the runtime says the type is. `is_generic` marks an open definition — ``List`1`` rather than `List<int>` — whose field offsets are not answerable. |
+| explicit_layout *(2)* | no | The type placed its own fields (`[StructLayout(LayoutKind.Explicit)]`), so members may legitimately overlap. |
+| token *(2)* | no | Metadata token. |
+| source *(3)* | no | `"live"`, `"static"` or `"both"` — which reading this type came from in a merged dump. A generic instantiation only exists once something has run, so it is live-only; a type nothing ever touched is never in the runtime's class cache, so it is static-only. Absent on a single-reading dump. |
 | properties[], functions[] | no | See below. |
 
 ## Properties
@@ -77,6 +91,9 @@ One JSON file per game build. Zircon writes it, any dumper can. This is the same
 | is_bitfield, bit_index, byte_mask, field_mask | no | For `bool` bitfields sharing one byte. |
 | flags, flag_names[] | no | Raw EPropertyFlags as an integer and the decoded names. |
 | default | no | Default value as a string, taken from the class default object. |
+| offset_unresolved *(2)* | no | The source could not answer for this member's offset and did not guess. An open generic's fields, a const, and a thread-static all land here. |
+| boxed_offset *(2)* | no | IL2CPP value types only: the offset the runtime reported, measured from the start of a *boxed* object and so including the object header. `offset` is that minus the header. Both are kept, and neither should be inferred from the other. |
+| is_static *(2)* | no | A static field. It has no place in the instance layout. |
 
 ## Type references
 
@@ -112,14 +129,16 @@ Recursive. `kind` is one of `bool int8 uint8 int16 uint16 int32 uint32 int64 uin
   "values": [ { "name": "ENetRole::ROLE_None", "value": 0 }, { "name": "ENetRole::ROLE_Authority", "value": 3 } ] }
 ```
 
-`underlying` defaults to `uint8`. Values wider than the underlying type are widened on import; negative values in unsigned enums are wrapped.
+`underlying` defaults to `uint8` and is one of `int8 uint8 int16 uint16 int32 uint32 int64 uint64` — the IR's own vocabulary, not the language's, so an IL2CPP enum over `System.Int32` says `int32`. Values wider than the underlying type are widened on import; negative values in unsigned enums are wrapped.
+
+A schema 2 enum may also carry `values_resolved: false`, meaning the dumper could read the member names but not their values and refused to number them by position.
 
 ## Rules of thumb for other dumpers
 
 - Emit paths exactly as the engine reports them (`GetPathName()`); Zdex diffs builds by path.
 - Sizes are bytes, offsets are bytes, addresses are hex strings relative to `module_base`.
 - Leave out what you do not know rather than guessing; every key except the ones marked required is optional.
-- Gzip the file before uploading. The first 64 KB must contain `"schema_version"` and `"header"` — write the header first.
+- Gzip the file before uploading. The first 64 KB must contain `"schema_version"`, `"header"` and, if you set it, `"runtime"` — write the header first. An IL2CPP dump can run to several hundred megabytes uncompressed and twenty compressed; the upload limit applies to what is sent.
 - Test with the API: `POST /upload/init` → chunks → `finish`; a rejected file comes back with a message naming what is missing.
 
-Something in the format holding you back? Say so through " rel="noopener">the contact form; the schema grows by adding keys, never by breaking existing ones.
+Something in the format holding you back? Say so through [the contact form](https://zsync.eu/ttz/); the schema grows by adding keys, never by breaking existing ones.
